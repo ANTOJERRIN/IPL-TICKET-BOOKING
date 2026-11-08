@@ -1,0 +1,15 @@
+CREATE TABLE IF NOT EXISTS customers(id TEXT PRIMARY KEY,name TEXT NOT NULL,email TEXT UNIQUE NOT NULL,password TEXT NOT NULL,created INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES customers(id),expires INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,home TEXT NOT NULL,away TEXT NOT NULL,venue TEXT NOT NULL,city TEXT NOT NULL,starts TEXT NOT NULL,demo INTEGER NOT NULL DEFAULT 1,published INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS stands(id TEXT PRIMARY KEY,event_id TEXT NOT NULL REFERENCES events(id),name TEXT NOT NULL,price INTEGER NOT NULL CHECK(price>0),capacity INTEGER NOT NULL CHECK(capacity>=0));
+CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES customers(id),stand_id TEXT NOT NULL REFERENCES stands(id),qty INTEGER NOT NULL CHECK(qty BETWEEN 1 AND 6),total INTEGER NOT NULL,status TEXT NOT NULL CHECK(status IN ('reserved','confirmed','expired','cancelled')),expires INTEGER NOT NULL,created INTEGER NOT NULL,demo INTEGER NOT NULL,payment_id TEXT UNIQUE,idempotency TEXT NOT NULL,UNIQUE(user_id,idempotency));
+CREATE TABLE IF NOT EXISTS attempts(bucket TEXT PRIMARY KEY,count INTEGER NOT NULL,expires INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS resets(token TEXT PRIMARY KEY,user_id TEXT NOT NULL,expires INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS payment_events(id TEXT PRIMARY KEY,created INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS orders_inventory ON orders(stand_id,status,expires);
+CREATE INDEX IF NOT EXISTS orders_customer ON orders(user_id,created);
+CREATE TRIGGER IF NOT EXISTS inventory_guard BEFORE INSERT ON orders WHEN NEW.status='reserved' BEGIN SELECT CASE WHEN NEW.qty > (SELECT capacity FROM stands WHERE id=NEW.stand_id) - COALESCE((SELECT SUM(qty) FROM orders WHERE stand_id=NEW.stand_id AND (status='confirmed' OR (status='reserved' AND expires>unixepoch()))),0) THEN RAISE(ABORT,'Sold out') END; END;
+INSERT OR IGNORE INTO events VALUES('practice-mumbai','MI','CSK','Wankhede Stadium','Mumbai','2027-03-20T19:30:00+05:30',1,1),('practice-bengaluru','RCB','KKR','M. Chinnaswamy Stadium','Bengaluru','2027-03-21T19:30:00+05:30',1,1),('practice-chennai','CSK','RR','M. A. Chidambaram Stadium','Chennai','2027-03-22T19:30:00+05:30',1,1),('practice-kolkata','KKR','MI','Eden Gardens','Kolkata','2027-03-23T19:30:00+05:30',1,1);
+INSERT OR IGNORE INTO stands SELECT id||'-general',id,'General stand',150000,120 FROM events;
+INSERT OR IGNORE INTO stands SELECT id||'-pavilion',id,'Pavilion',300000,60 FROM events;
+INSERT OR IGNORE INTO stands SELECT id||'-club',id,'Club lounge',550000,24 FROM events;

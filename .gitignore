@@ -1,0 +1,6 @@
+boundary-sales-source.zip
+**/node_modules/
+**/dist/
+**/.env
+**/.env.*
+**/.dev.vars
