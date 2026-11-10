@@ -18,15 +18,48 @@ export async function shop(request:Request):Promise<Response>{
  const paymentsConfigured=!!secrets.STRIPE_SECRET_KEY&&!!secrets.STRIPE_WEBHOOK_SECRET;
  const paymentMode=secrets.STRIPE_SECRET_KEY?.startsWith('sk_live_')?'live':secrets.STRIPE_SECRET_KEY?.startsWith('sk_test_')?'test':'unconfigured';
  const need=()=>{if(!user)fail('Please sign in to continue.',401);return user!;};
+ async function notify(id:string){
+ if(!secrets.RESEND_API_KEY||!secrets.EMAIL_FROM)return {status:'unconfigured'};
+ const o=await db!.prepare("SELECT o.*,d.buyer_email,s.name stand,e.home,e.away,e.starts,e.venue,c.payment_mode FROM orders o JOIN checkout_details d ON d.order_id=o.id JOIN stands s ON s.id=o.stand_id JOIN events e ON e.id=s.event_id LEFT JOIN checkout_sessions c ON c.order_id=o.id WHERE o.id=? AND o.status='confirmed'").bind(id).first<any>();
+ if(!o)return {status:'ineligible'};
+ const label=o.demo?'PRACTICE BOOKING — NOT VALID FOR ADMISSION':o.payment_mode!=='live'?'TEST PAYMENT — NOT VALID FOR ADMISSION':'BOOKING CONFIRMED';
+ const payload=JSON.stringify({from:secrets.EMAIL_FROM,to:o.buyer_email,subject:'Boundary · '+label,text:label+'\n'+o.home+' vs '+o.away+'\n'+o.venue+' · '+o.starts+'\nStand: '+o.stand+'\nQuantity: '+o.qty+'\nBooking reference: '+o.id+'\n'+(o.demo?'No payment was collected.':o.payment_mode!=='live'?'Test payment only.':'Keep this reference for the operator admission check.')+'\nOpen your ticket wallet: https://boundary-ticket-club.higgsfield.app/'});
+ await db!.prepare('INSERT OR IGNORE INTO booking_emails(order_id,payload,created) VALUES(?,?,?)').bind(id,payload,time).run();
+ const mail=await db!.prepare('SELECT * FROM booking_emails WHERE order_id=?').bind(id).first<any>();
+ if(mail.sent_at)return {status:'sent'};
+ // Stop automatic retries before the provider's 24-hour deduplication window closes.
+ if(time-mail.created>=82800)return {status:'needs_review'};
+ const lock=await db!.prepare('UPDATE booking_emails SET locked_until=? WHERE order_id=? AND sent_at IS NULL AND locked_until<=?').bind(time+90,id,time).run();
+ if(!lock.meta.changes)return {status:'pending'};
+ try{
+ const response=await fetch('https://api.resend.com/emails',{method:'POST',headers:{Authorization:'Bearer '+secrets.RESEND_API_KEY,'Content-Type':'application/json','Idempotency-Key':'booking/'+id},body:mail.payload,signal:AbortSignal.timeout(15000)});
+ if(!response.ok)return {status:'pending'};
+ const result=await response.json() as {id?:string};if(!result.id)return {status:'pending'};
+ await db!.prepare('UPDATE booking_emails SET sent_at=?,provider_id=? WHERE order_id=?').bind(time,result.id,id).run();
+ return {status:'sent'};
+ }catch{return {status:'pending'};}
+ }
+
+ async function syncRefund(row:any,data:any){
+ const statuses=['pending','requires_action','succeeded','failed','canceled'];
+ if(!data||!/^re_[a-zA-Z0-9_]+$/.test(data.id||'')||data.amount!==row.amount||data.currency!=='inr'||data.payment_intent!==row.payment_intent||!statuses.includes(data.status)||(row.provider_id&&data.id!==row.provider_id))fail('Provider refund requires reconciliation.',502);
+ await db!.prepare("UPDATE provider_refunds SET provider_id=?,status=?,updated=?,locked_until=0 WHERE order_id=? AND (status<>'succeeded' OR ?='succeeded')").bind(data.id,data.status,time,row.order_id,data.status).run();const current=await db!.prepare('SELECT status FROM provider_refunds WHERE order_id=?').bind(row.order_id).first<any>();return current.status;
+ }
+ async function retrieveRefund(row:any){
+ if(!row.provider_id||!/^re_[a-zA-Z0-9_]+$/.test(row.provider_id))fail('No provider refund reference is recorded. Retry the original request or reconcile with the provider.',409);
+ const r=await fetch('https://api.stripe.com/v1/refunds/'+encodeURIComponent(row.provider_id),{signal:AbortSignal.timeout(20000),headers:{Authorization:'Bearer '+secrets.STRIPE_SECRET_KEY}});if(!r.ok)fail('Unable to check the refund provider. Please retry later.',502);
+ return await syncRefund(row,await r.json());
+ }
  if(request.method==='GET'){
  if(path==='/api/sales-status')return out({paymentsConfigured,paymentMode:paymentsConfigured?paymentMode:'unconfigured',practiceAvailable:true});
- if(path==='/api/me')return out({user});
+ if(path==='/api/me')return out({user:user?{...user,isAdmin:!!secrets.ADMIN_EMAIL&&user.email===secrets.ADMIN_EMAIL.toLowerCase()}:null});
  if(path==='/api/events'){const events=await db.prepare('SELECT * FROM events WHERE published=1 ORDER BY starts').all();const stands=await db.prepare("SELECT s.*,MAX(0,s.capacity-COALESCE((SELECT SUM(qty) FROM orders o WHERE o.stand_id=s.id AND (o.status='confirmed' OR (o.status='reserved' AND o.expires>?))),0)) available FROM stands s").bind(time).all();return out({events:events.results,stands:stands.results});}
- if(path==='/api/orders'){const u=need();return out({orders:(await db.prepare("SELECT o.*,d.buyer_name,d.buyer_email,d.phone,s.name stand,e.home,e.away,e.venue,e.city,e.starts FROM orders o LEFT JOIN checkout_details d ON d.order_id=o.id JOIN stands s ON s.id=o.stand_id JOIN events e ON e.id=s.event_id WHERE o.user_id=? ORDER BY o.created DESC").bind(u.id).all()).results.map((o:any)=>({...o,status:o.status==='reserved'&&o.expires<=time?'expired':o.status}))});}
+ if(path==='/api/orders'){const u=need();return out({orders:(await db.prepare("SELECT o.*,f.status provider_refund_status,c.payment_mode,CASE WHEN m.sent_at IS NOT NULL THEN 'sent' WHEN m.created IS NOT NULL THEN 'pending' ELSE 'not_sent' END email_status,r.status refund_status,d.buyer_name,d.buyer_email,d.phone,s.name stand,e.home,e.away,e.venue,e.city,e.starts FROM orders o LEFT JOIN provider_refunds f ON f.order_id=o.id LEFT JOIN checkout_sessions c ON c.order_id=o.id LEFT JOIN booking_emails m ON m.order_id=o.id LEFT JOIN refund_requests r ON r.order_id=o.id LEFT JOIN checkout_details d ON d.order_id=o.id JOIN stands s ON s.id=o.stand_id JOIN events e ON e.id=s.event_id WHERE o.user_id=? ORDER BY o.created DESC").bind(u.id).all()).results.map((o:any)=>({...o,status:o.provider_refund_status==='succeeded'?'refunded':o.status==='reserved'&&o.expires<=time?'expired':o.status}))});}
  if(path==='/api/admin'){const u=need();if(!secrets.ADMIN_EMAIL||u.email!==secrets.ADMIN_EMAIL.toLowerCase())fail('Administrator access required.',403);
  const summary=await db.prepare("SELECT COALESCE(SUM(CASE WHEN o.demo=0 AND o.status='confirmed' AND c.payment_mode='live' THEN o.total ELSE 0 END),0) revenue,COALESCE(SUM(CASE WHEN o.demo=0 AND o.status='confirmed' AND c.payment_mode='live' THEN o.qty ELSE 0 END),0) tickets_sold,COALESCE(SUM(CASE WHEN o.status='reserved' AND o.expires>? THEN 1 ELSE 0 END),0) active_reservations,COALESCE(SUM(CASE WHEN o.demo=1 AND o.status='confirmed' THEN 1 ELSE 0 END),0) practice_orders FROM orders o LEFT JOIN checkout_sessions c ON c.order_id=o.id").bind(time).first();
  const reconciliation=(await db.prepare("SELECT id,created FROM payment_events WHERE id LIKE 'late:%' ORDER BY created DESC LIMIT 50").all()).results;
- return out({summary,reconciliation,paymentMode,webhookConfigured:!!secrets.STRIPE_WEBHOOK_SECRET,events:(await db.prepare('SELECT * FROM events ORDER BY starts').all()).results,orders:(await db.prepare('SELECT id,qty,total,status,demo,created FROM orders ORDER BY created DESC LIMIT 100').all()).results,paymentsConfigured});}
+ const refundTotal=await db.prepare("SELECT COALESCE(SUM(amount),0) amount FROM provider_refunds WHERE status='succeeded'").first<any>();
+ return out({refundedTotal:refundTotal?.amount||0,refunds:(await db.prepare('SELECT r.*,o.total,o.demo,f.status provider_status,f.provider_id FROM refund_requests r JOIN orders o ON o.id=r.order_id LEFT JOIN provider_refunds f ON f.order_id=o.id ORDER BY r.created DESC LIMIT 100').all()).results,summary,reconciliation,paymentMode,webhookConfigured:!!secrets.STRIPE_WEBHOOK_SECRET,events:(await db.prepare('SELECT * FROM events ORDER BY starts').all()).results,orders:(await db.prepare('SELECT id,qty,total,status,demo,created FROM orders ORDER BY created DESC LIMIT 100').all()).results,paymentsConfigured});}
  fail('Not found.',404);
  }
  if(request.method!=='POST')fail('Method not allowed.',405);
@@ -36,14 +69,19 @@ export async function shop(request:Request):Promise<Response>{
  const sig=request.headers.get('stripe-signature')||'';const ts=sig.match(/(?:^|,)t=(\d+)/)?.[1];const signatures=[...sig.matchAll(/(?:^|,)v1=([a-f0-9]+)/g)].map(x=>x[1]);
  if(!ts||Math.abs(time-Number(ts))>300)fail('Invalid signature.',400);
  const key=await crypto.subtle.importKey('raw',new TextEncoder().encode(secrets.STRIPE_WEBHOOK_SECRET),{name:'HMAC',hash:'SHA-256'},false,['sign']);const expected=hex(await crypto.subtle.sign('HMAC',key,new TextEncoder().encode(ts+'.'+raw)));if(!signatures.some(s=>equal(s,expected)))fail('Invalid signature.',400);
- const event=JSON.parse(raw);if(event.type!=='checkout.session.completed')return out({received:true});const s=event.data.object;if(s.payment_status!=='paid')return out({received:true});
+ const event=JSON.parse(raw);
+ if(['refund.created','refund.updated','refund.failed'].includes(event.type)){
+ const ref=event.data?.object?.id;const row=typeof ref==='string'?await db.prepare('SELECT * FROM provider_refunds WHERE provider_id=?').bind(ref).first<any>():null;
+ if(row){if(event.livemode!==true||paymentMode!=='live')fail('Refund notification mode mismatch.',400);await retrieveRefund(row);}return out({received:true});
+ }
+ if(event.type!=='checkout.session.completed')return out({received:true});const s=event.data.object;if(s.payment_status!=='paid')return out({received:true});
  const order=await db.prepare('SELECT * FROM orders WHERE id=?').bind(s.client_reference_id).first<any>();if(order&&!order.payment_id)fail('Checkout is still being recorded. Retry notification.',503);if(!order||order.demo||order.total!==s.amount_total||s.currency!=='inr'||order.payment_id!==s.id)fail('Payment does not match order.');
- if(order.status==='confirmed')return out({received:true});
+ if(order.status==='confirmed'){await notify(order.id);return out({received:true});}
  // Late payment never oversells: retain a reconciliation record for operator refund.
  if(order.status!=='reserved'||order.expires<=time){await db.prepare('INSERT OR IGNORE INTO payment_events VALUES(?,?)').bind('late:'+event.id,time).run();return out({received:true,reconciliation:true});}
- await db.batch([db.prepare("UPDATE orders SET status='confirmed' WHERE id=? AND status='reserved' AND expires>?").bind(order.id,time),db.prepare('INSERT OR IGNORE INTO payment_events VALUES(?,?)').bind(event.id,time)]);return out({received:true});
+ await db.batch([db.prepare("UPDATE orders SET status='confirmed' WHERE id=? AND status='reserved' AND expires>?").bind(order.id,time),db.prepare('INSERT OR IGNORE INTO payment_events VALUES(?,?)').bind(event.id,time)]);await notify(order.id);return out({received:true});
  }
- const raw=await request.text();if(raw.length>16000)fail('Request too large.',413);const body=JSON.parse(raw||'{}');
+ const raw=await request.text();if(raw.length>16000)fail('Request too large.',413);let body:any;try{body=JSON.parse(raw||'{}');}catch{fail('Invalid request JSON.');}if(!body||typeof body!=='object'||Array.isArray(body))fail('Invalid request body.');
  if(['/api/signup','/api/login','/api/forgot','/api/reset'].includes(path)){
  const ip=request.headers.get('cf-connecting-ip')||'unknown';const bucket=await digest(ip+':'+Math.floor(time/900));await db.prepare('INSERT INTO attempts VALUES(?,1,?) ON CONFLICT(bucket) DO UPDATE SET count=count+1').bind(bucket,time+900).run();const a=await db.prepare('SELECT count FROM attempts WHERE bucket=?').bind(bucket).first<{count:number}>();if(a&&a.count>30)fail('Too many attempts. Please try again in 15 minutes.',429);
  await db.prepare('DELETE FROM attempts WHERE expires<?').bind(time).run();
@@ -67,8 +105,8 @@ export async function shop(request:Request):Promise<Response>{
  }
  if(path==='/api/cancel'){const u=need();const existing=await db.prepare('SELECT payment_id,status FROM orders WHERE id=? AND user_id=?').bind(text(body.id,100),u.id).first<any>();if(!existing)fail('Order not found.',404);if(existing.payment_id)fail('Payment checkout already started. The reservation will release after checkout expires.',409);if(existing.status==='confirmed')fail('Confirmed bookings cannot be cancelled here.',409);await db.prepare("UPDATE orders SET status='cancelled' WHERE id=? AND user_id=? AND status='reserved' AND payment_id IS NULL").bind(text(body.id,100),u.id).run();return out({ok:true});}
  if(path==='/api/pay'){
- const u=need();const o=await db.prepare('SELECT o.*,s.name,e.home,e.away FROM orders o JOIN stands s ON s.id=o.stand_id JOIN events e ON e.id=s.event_id WHERE o.id=? AND o.user_id=?').bind(text(body.id,100),u.id).first<any>();if(!o)fail('Order not found.',404);if(o.status==='confirmed')return out({confirmed:true});if(o.status!=='reserved'||o.expires<=time)fail('Reservation expired. Please reserve again.');
- if(o.demo){await db.prepare("UPDATE orders SET status='confirmed' WHERE id=? AND status='reserved' AND expires>?").bind(o.id,time).run();return out({confirmed:true,demo:true});}
+ const u=need();const o=await db.prepare('SELECT o.*,s.name,e.home,e.away FROM orders o JOIN stands s ON s.id=o.stand_id JOIN events e ON e.id=s.event_id WHERE o.id=? AND o.user_id=?').bind(text(body.id,100),u.id).first<any>();if(!o)fail('Order not found.',404);if(o.status==='confirmed'){await notify(o.id);return out({confirmed:true});}if(o.status!=='reserved'||o.expires<=time)fail('Reservation expired. Please reserve again.');
+ if(o.demo){await db.prepare("UPDATE orders SET status='confirmed' WHERE id=? AND status='reserved' AND expires>?").bind(o.id,time).run();await notify(o.id);return out({confirmed:true,demo:true});}
  if(!paymentsConfigured)fail('Payment checkout and verification are not configured.',503);
  // Persist checkout expiry once: retrying a provider request must use identical parameters.
  await db.prepare('INSERT OR IGNORE INTO checkout_sessions VALUES(?,?,?)').bind(o.id,time+1860,paymentMode).run();
@@ -78,6 +116,83 @@ export async function shop(request:Request):Promise<Response>{
  const renewed=await db.prepare("UPDATE orders SET expires=? WHERE id=? AND status='reserved' AND expires>?").bind(o.expires,o.id,time).run();if(!renewed.meta.changes)fail('Reservation expired. Please reserve again.');
  const form=new URLSearchParams({mode:'payment',success_url:url.origin+'/?payment=success&order='+o.id,cancel_url:url.origin+'/?payment=cancelled&order='+o.id,client_reference_id:o.id,customer_email:u.email,'line_items[0][price_data][currency]':'inr','line_items[0][price_data][unit_amount]':String(o.total),'line_items[0][price_data][product_data][name]':`${o.home} vs ${o.away} · ${o.qty} tickets · ${o.name}`,'line_items[0][quantity]':'1',expires_at:String(o.expires),'payment_method_types[0]':'card','payment_intent_data[receipt_email]':u.email});
  const r=await fetch('https://api.stripe.com/v1/checkout/sessions',{method:'POST',headers:{Authorization:'Bearer '+secrets.STRIPE_SECRET_KEY,'Content-Type':'application/x-www-form-urlencoded','Idempotency-Key':o.id},body:form});const data=await r.json() as any;if(!r.ok||!data.url)fail('Payment checkout is unavailable. Please try again.',502);await db.prepare('UPDATE orders SET payment_id=? WHERE id=?').bind(data.id,o.id).run();return out({url:data.url});
+ }
+ if(path==='/api/booking-email'){
+ const u=need();const id=text(body.id,100);const o=await db.prepare("SELECT id FROM orders WHERE id=? AND user_id=? AND status='confirmed'").bind(id,u.id).first();
+ if(!o)fail('Confirmed order not found.',404);
+ const result=await notify(id);if(result.status==='unconfigured')fail('Confirmation email is not configured. Your ticket remains available in your wallet.',503);
+ return out(result);
+ }
+ if(path==='/api/refund-request'){
+ const u=need();const id=text(body.id,100);const reason=text(body.reason,500);
+ const o=await db.prepare("SELECT o.*,c.payment_mode FROM orders o LEFT JOIN checkout_sessions c ON c.order_id=o.id WHERE o.id=? AND o.user_id=?").bind(id,u.id).first<any>();
+ if(!o)fail('Order not found.',404);if(o.demo||o.status!=='confirmed'||o.payment_mode!=='live')fail('Only confirmed live payments are eligible for a refund request.',409);
+ await db.prepare('INSERT OR IGNORE INTO refund_requests(order_id,user_id,reason,created) VALUES(?,?,?,?)').bind(id,u.id,reason,time).run();
+ return out({ok:true,message:'Request recorded for operator review. No refund has been issued.'});
+ }
+ if(path==='/api/admin/ticket'){
+ const u=need();if(!secrets.ADMIN_EMAIL||u.email!==secrets.ADMIN_EMAIL.toLowerCase())fail('Administrator access required.',403);
+ const id=text(body.id,100),eventId=text(body.eventId,100);
+ const o=await db.prepare("SELECT o.id,o.qty,o.status,o.demo,c.payment_mode,d.buyer_name,s.name stand,s.event_id,e.home,e.away,e.venue,COALESCE(a.admitted,0) admitted FROM orders o JOIN stands s ON s.id=o.stand_id JOIN events e ON e.id=s.event_id LEFT JOIN checkout_details d ON d.order_id=o.id LEFT JOIN checkout_sessions c ON c.order_id=o.id LEFT JOIN admissions a ON a.order_id=o.id WHERE o.id=?").bind(id).first<any>();
+ if(!o)fail('Ticket not found.',404);if(o.event_id!==eventId)fail('This ticket belongs to a different match.',409);
+ if(o.status!=='confirmed'||o.demo||o.payment_mode!=='live')fail('This booking is not valid for admission.',409);
+ if(await db.prepare('SELECT order_id FROM provider_refunds WHERE order_id=?').bind(o.id).first())fail('Refund processing blocks entry. Ask the operator to reconcile this booking.',409);
+ return out({ticket:{id:o.id,qty:o.qty,admitted:o.admitted,remaining:o.qty-o.admitted,buyer_name:o.buyer_name,stand:o.stand,home:o.home,away:o.away,venue:o.venue}});
+ }
+ if(path==='/api/admin/admit'){
+ const u=need();if(!secrets.ADMIN_EMAIL||u.email!==secrets.ADMIN_EMAIL.toLowerCase())fail('Administrator access required.',403);
+ const id=text(body.id,100);const qty=Number(body.qty);if(!Number.isInteger(qty)||qty<1||qty>6)fail('Enter an admission quantity from 1 to 6.');
+ const o=await db.prepare("SELECT o.*,c.payment_mode FROM orders o LEFT JOIN checkout_sessions c ON c.order_id=o.id WHERE o.id=?").bind(id).first<any>();
+ if(body.eventId!==undefined){const match=await db.prepare('SELECT event_id FROM stands WHERE id=?').bind(o?.stand_id||'').first<any>();if(!match||match.event_id!==text(body.eventId,100))fail('This ticket belongs to a different match.',409);}
+ if(!o)fail('Ticket not found.',404);if(o.status!=='confirmed'||o.demo||o.payment_mode!=='live')fail('This booking is not valid for admission.',409);
+ if(await db.prepare('SELECT order_id FROM provider_refunds WHERE order_id=?').bind(o.id).first())fail('Refund processing blocks entry. Ask the operator to reconcile this booking.',409);
+ if(body.idempotency!==undefined){
+ const key=text(body.idempotency,100);const previous=await db.prepare('SELECT * FROM admission_actions WHERE id=?').bind(key).first<any>();
+ if(previous&&(previous.order_id!==id||previous.qty!==qty||previous.operator_id!==u.id))fail('Admission retry does not match the original request.',409);
+ try{await db.prepare('INSERT OR IGNORE INTO admission_actions(id,order_id,qty,operator_id,created) VALUES(?,?,?,?,?)').bind(key,id,qty,u.id,time).run();}catch{fail('Admission exceeds the remaining ticket quantity.',409);}
+ }else{
+ const result=await db.prepare("INSERT INTO admissions(order_id,admitted,updated,operator_id) SELECT ?,?,?,? WHERE ? <= ? ON CONFLICT(order_id) DO UPDATE SET admitted=admitted+excluded.admitted,updated=excluded.updated,operator_id=excluded.operator_id WHERE admitted+excluded.admitted <= ?").bind(id,qty,time,u.id,qty,o.qty,o.qty).run();
+ if(!result.meta.changes)fail('Admission exceeds the remaining ticket quantity.',409);
+ }
+ const a=await db.prepare('SELECT admitted FROM admissions WHERE order_id=?').bind(id).first<any>();
+ return out({ok:true,admitted:a.admitted,remaining:o.qty-a.admitted});
+ }
+ if(path==='/api/admin/refund'||path==='/api/admin/refund-refresh'){
+ const u=need();if(!secrets.ADMIN_EMAIL||u.email!==secrets.ADMIN_EMAIL.toLowerCase())fail('Administrator access required.',403);
+ if(!paymentsConfigured||paymentMode!=='live')fail('Live payment configuration is required for provider refunds.',503);
+ const id=text(body.id,100);const o=await db.prepare("SELECT o.*,c.payment_mode,r.status review_status FROM orders o LEFT JOIN checkout_sessions c ON c.order_id=o.id LEFT JOIN refund_requests r ON r.order_id=o.id WHERE o.id=?").bind(id).first<any>();
+ if(!o)fail('Order not found.',404);if(o.demo||o.status!=='confirmed'||o.payment_mode!=='live')fail('Only confirmed live payments can be refunded.',409);
+ let row=await db.prepare('SELECT * FROM provider_refunds WHERE order_id=?').bind(id).first<any>();
+ if(path==='/api/admin/refund-refresh'){if(!row)fail('No provider refund has been started.',404);return out({status:await retrieveRefund(row)});}
+ if(body.confirm!==true||body.amount!==o.total)fail('Confirm the full displayed refund amount.',400);
+ if(o.review_status!=='reviewed')fail('Review the customer refund request before issuing a refund.',409);
+ if(!row){
+ try{await db.prepare('INSERT OR IGNORE INTO provider_refunds(order_id,amount,created,updated,operator_id) VALUES(?,?,?,?,?)').bind(id,o.total,time,time,u.id).run();}catch{fail('Guests have already entered. This refund needs manual operator review.',409);}
+ row=await db.prepare('SELECT * FROM provider_refunds WHERE order_id=?').bind(id).first<any>();
+ }
+ if(row.provider_id)return out({status:await retrieveRefund(row)});
+ if(row.created<time-82800)fail('This unconfirmed refund is older than the safe retry window. Reconcile it in the provider dashboard; do not create a new refund.',409);
+ const lease=await db.prepare('UPDATE provider_refunds SET locked_until=? WHERE order_id=? AND locked_until<=?').bind(time+90,id,time).run();if(!lease.meta.changes)fail('Refund processing is already in progress. Check again shortly.',409);
+ try{
+ if(!row.payment_intent){
+ const r=await fetch('https://api.stripe.com/v1/checkout/sessions/'+encodeURIComponent(o.payment_id),{signal:AbortSignal.timeout(20000),headers:{Authorization:'Bearer '+secrets.STRIPE_SECRET_KEY}});if(!r.ok)fail('Unable to verify the original payment.',502);const session=await r.json() as any;
+ if(session.id!==o.payment_id||session.client_reference_id!==id||session.amount_total!==o.total||session.currency!=='inr'||session.payment_status!=='paid'||session.livemode!==true||!/^pi_[a-zA-Z0-9_]+$/.test(session.payment_intent||''))fail('Original payment does not match the booking.',409);
+ row.payment_intent=session.payment_intent;await db.prepare('UPDATE provider_refunds SET payment_intent=? WHERE order_id=?').bind(row.payment_intent,id).run();
+ }
+ const form=new URLSearchParams({payment_intent:row.payment_intent,amount:String(row.amount),'metadata[order_id]':id,reason:'requested_by_customer'});
+ const r=await fetch('https://api.stripe.com/v1/refunds',{method:'POST',signal:AbortSignal.timeout(20000),headers:{Authorization:'Bearer '+secrets.STRIPE_SECRET_KEY,'Content-Type':'application/x-www-form-urlencoded','Idempotency-Key':'refund/'+id},body:form});if(!r.ok)fail('Refund outcome is unconfirmed. Retry this same request within 23 hours or reconcile with the provider.',502);
+ return out({status:await syncRefund(row,await r.json())});
+ }catch(error:any){if(error?.status)throw error;fail('Refund outcome is unconfirmed. Retry the original request or reconcile with the provider.',502);}finally{await db.prepare('UPDATE provider_refunds SET locked_until=0 WHERE order_id=? AND locked_until=?').bind(id,time+90).run();}
+ }
+ if(path==='/api/admin/refund-review'){
+ const u=need();if(!secrets.ADMIN_EMAIL||u.email!==secrets.ADMIN_EMAIL.toLowerCase())fail('Administrator access required.',403);
+ const result=await db.prepare("UPDATE refund_requests SET status='reviewed' WHERE order_id=?").bind(text(body.id,100)).run();if(!result.meta.changes)fail('Request not found.',404);
+ return out({ok:true,message:'Marked reviewed. This does not issue a payment refund.'});
+ }
+ if(path==='/api/admin/publish'){
+ const u=need();if(!secrets.ADMIN_EMAIL||u.email!==secrets.ADMIN_EMAIL.toLowerCase())fail('Administrator access required.',403);
+ if(typeof body.published!=='boolean')fail('Choose a publication status.');
+ const result=await db.prepare('UPDATE events SET published=? WHERE id=?').bind(body.published?1:0,text(body.id,100)).run();if(!result.meta.changes)fail('Match not found.',404);return out({ok:true});
  }
  if(path==='/api/admin/event'){
  const u=need();if(!secrets.ADMIN_EMAIL||u.email!==secrets.ADMIN_EMAIL.toLowerCase())fail('Administrator access required.',403);const id=crypto.randomUUID();const starts=text(body.starts,40);if(!Number.isFinite(Date.parse(starts))||Date.parse(starts)<Date.now())fail('Choose a future match date.');const cap=Number(body.capacity),price=Number(body.price);if(!Number.isInteger(cap)||cap<1||cap>100000||!Number.isInteger(price)||price<100||price>100000000)fail('Check capacity and price.');await db.batch([db.prepare('INSERT INTO events VALUES(?,?,?,?,?,?,?,1)').bind(id,text(body.home,12),text(body.away,12),text(body.venue),text(body.city,60),starts,body.demo===false?0:1),db.prepare('INSERT INTO stands VALUES(?,?,?,?,?)').bind(id+'-general',id,'General stand',price,cap)]);return out({ok:true});

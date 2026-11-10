@@ -1,0 +1,2 @@
+CREATE TABLE IF NOT EXISTS admissions(order_id TEXT PRIMARY KEY REFERENCES orders(id),admitted INTEGER NOT NULL DEFAULT 0 CHECK(admitted>=0),updated INTEGER NOT NULL,operator_id TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS refund_requests(order_id TEXT PRIMARY KEY REFERENCES orders(id),user_id TEXT NOT NULL REFERENCES customers(id),reason TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'requested' CHECK(status IN ('requested','reviewed')),created INTEGER NOT NULL);

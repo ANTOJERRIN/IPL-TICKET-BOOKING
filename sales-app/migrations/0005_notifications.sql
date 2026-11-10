@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS booking_emails(order_id TEXT PRIMARY KEY REFERENCES orders(id),payload TEXT NOT NULL,created INTEGER NOT NULL,locked_until INTEGER NOT NULL DEFAULT 0,sent_at INTEGER,provider_id TEXT);
