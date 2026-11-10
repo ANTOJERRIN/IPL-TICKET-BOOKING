@@ -1,0 +1,18 @@
+{
+  "name": "boundary-local-preview",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test:ui": "node tests/stadium.mjs && node tests/booking-ui.mjs"
+  },
+  "dependencies": {
+    "esbuild": "0.27.4",
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  },
+  "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "react-test-renderer": "^19.2.0"
+  }
+}

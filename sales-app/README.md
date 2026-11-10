@@ -22,7 +22,7 @@ cd sales-app
 node --experimental-strip-types tests/booking.mjs
 ```
 
-27 integration checks passed in the cloud editing environment and again in the local workspace. Payment calls are mocked; no real charges were made.
+50 integration checks passed in the cloud editing environment and again in the local workspace. Payment calls are mocked; no real charges were made. Independent OpenCV verification decoded 12 QR payloads in four orientations each.
 
 ## Runtime and configuration
 
@@ -32,4 +32,8 @@ Configure `ADMIN_EMAIL`, `STRIPE_SECRET_KEY`, and `STRIPE_WEBHOOK_SECRET` in sec
 
 ## Current limits
 
-No payment secrets or authorized real match inventory have been configured. Practice bookings do not grant stadium admission. The hosted build passed, but public browser verification encountered a gateway authentication restriction. Real provider testing, refunds, admission QR scanning and production operations remain unfinished. This branch is for review, not a declaration of production readiness.
+No payment secrets or authorized real match inventory have been configured. Practice bookings do not grant stadium admission. The hosted build passed, but public browser verification encountered a gateway authentication restriction. Provider refunds and confirmation emails are implemented; actual provider delivery and production operations remain unverified. Printable live-payment QR codes and an administrator scanner with manual fallback are implemented; live camera behavior remains unverified. This branch is for review, not a declaration of production readiness.
+
+## Local stadium preview
+
+See `../local-preview/README.md` to start the current storefront at http://localhost:5173. The local adapter uses the actual booking handler with SQLite and no provider credentials. The stadium supports rotation, zoom, top view and selectable stands linked to booking totals. Its layout is illustrative; individual seats are not assigned.

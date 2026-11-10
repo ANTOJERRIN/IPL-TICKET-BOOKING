@@ -1,0 +1,36 @@
+import {build} from 'esbuild';
+import {createElement as h,useState} from 'react';
+import {renderToStaticMarkup} from 'react-dom/server';
+import {create,act} from 'react-test-renderer';
+import {Resvg} from '@resvg/resvg-js';
+import {writeFileSync} from 'node:fs';
+import assert from 'node:assert/strict';
+
+await build({entryPoints:['../sales-app/src/lib/stadium-picker.tsx'],outfile:'.runtime/stadium-component.mjs',bundle:true,platform:'node',format:'esm',jsx:'automatic',packages:'external'});
+const {StadiumPicker,StadiumStandCards}=await import('../.runtime/stadium-component.mjs');
+const stands=[{id:'general',name:'General stand',price:150000,available:120},{id:'pavilion',name:'Pavilion',price:300000,available:60},{id:'club',name:'Club lounge',price:550000,available:0}];
+const html=renderToStaticMarkup(h(StadiumPicker,{stands,selectedId:'pavilion',onSelect:()=>{},venue:'Wankhede Stadium'}));
+const svg=html.match(/<svg[\s\S]*?<\/svg>/)[0].replace('<svg','<svg xmlns="http://www.w3.org/2000/svg"').replace(/(<svg[^>]*>)/,'$1<rect width="720" height="500" fill="#1b2923"/>');
+writeFileSync('.runtime/stadium-render.png',new Resvg(svg,{fitTo:{mode:'width',value:1080}}).render().asPng());
+assert.equal((html.match(/class="stadium-sector/g)||[]).length,24);
+assert.equal(html.includes('NaN'),false);
+globalThis.IS_REACT_ACT_ENVIRONMENT=true;
+let picked='general';
+function Harness({locked=false}){const [selectedId,setSelected]=useState('general');return h(StadiumPicker,{stands,selectedId,onSelect:id=>{picked=id;setSelected(id);},locked,venue:'Wankhede Stadium'});}
+let renderer;await act(()=>{renderer=create(h(Harness));});
+const root=renderer.root;
+const paths=()=>root.findAllByType('path').map(p=>p.props.d).join('');
+const initial=paths();await act(()=>root.findByProps({'aria-label':'Rotate stadium right'}).props.onClick());assert.notEqual(paths(),initial);
+const top=()=>root.findAllByType('button').find(b=>b.children.includes('Top view'));
+await act(()=>top().props.onClick());assert.equal(top().props['aria-pressed'],true);
+const pavilion=root.findAllByType('button').find(b=>b.children.includes('Pavilion'));
+await act(()=>pavilion.props.onClick());assert.equal(picked,'pavilion');
+const soldOut=root.findAllByType('button').find(b=>b.children.includes('Club lounge'));assert.equal(soldOut.props.disabled,true);
+const svgSector=root.findAll(n=>n.type==='g'&&n.props.role==='button'&&n.props['aria-label'].startsWith('General stand'))[0];
+await act(()=>svgSector.props.onKeyDown({key:'Enter',preventDefault(){}}));assert.equal(picked,'general');
+await act(()=>renderer.update(h(Harness,{locked:true})));assert.equal(root.findAllByType('button').find(b=>b.children.includes('Pavilion')).props.disabled,true);
+await act(()=>renderer.unmount());
+let cards;await act(()=>{cards=create(h(StadiumStandCards,{stands,selectedId:'general',onSelect:id=>picked=id}));});
+const second=cards.root.findAllByType('button')[1];await act(()=>second.props.onClick());assert.equal(picked,'pavilion');assert.equal(cards.root.findAllByType('button')[2].props.disabled,true);
+await act(()=>cards.unmount());
+console.log('PASS stadium rendering, rotation, top view, stand selection, keyboard selection, sold-out/locked states, stand-card synchronization');
